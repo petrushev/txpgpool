@@ -1,0 +1,9 @@
+*.pyc
+*.pyo
+.settings
+.directory
+.project
+.pydevproject
+conf
+twistd.pid
+twistd.log
