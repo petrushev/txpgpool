@@ -2,6 +2,7 @@ from collections import deque
 
 from twisted.internet.defer import Deferred, succeed
 from twisted.python import log
+from twisted.python.failure import Failure
 
 from psycopg2 import connect as pgConnect
 from psycopg2.extras import DictConnection
@@ -80,6 +81,11 @@ class BasePgPool(object):
         """Call to put a connection back to the pool explicitly."""
         raise NotImplementedError
 
+    def closeAll(self):
+        """Close all connections in the pool. If there is a client waiting its
+        errback will fire"""
+        raise NotImplementedError
+
 
 class NullPgPool(BasePgPool):
     """Does not do any pooling, provides direct connection to one single client at a time"""
@@ -128,6 +134,12 @@ class NullPgPool(BasePgPool):
         else:
             self.ready = True
 
+    def closeAll(self):
+        failure = Failure('Connection pool closed', ValueError)
+        while self._waitingForConn:
+            d = self._waitingForConn.popleft()
+            d.errback(failure)
+
 class StaticPgPool(BasePgPool):
     """Maintains only one connection, the clients must wait for it"""
 
@@ -173,6 +185,17 @@ class StaticPgPool(BasePgPool):
 
         else:
             self.ready = True
+
+    def closeAll(self):
+        if self.ready:
+            self.conn.close()
+            self.conn = None
+
+        failure = Failure('Connection pool closed', ValueError)
+        while self._waitingForConn:
+            d = self._waitingForConn.popleft()
+            d.errback(failure)
+
 
 class QueuePgPool(BasePgPool):
     """MinMax connection pool. Tries to maintain `min` number of ready connections.
@@ -228,3 +251,13 @@ class QueuePgPool(BasePgPool):
 
             else:
                 self._available.add(conn)
+
+    def closeAll(self):
+        while self._available:
+            conn = self._available.pop()
+            conn.close()
+
+        failure = Failure('Connection pool closed', ValueError)
+        while self._waitingForConn:
+            d = self._waitingForConn.popleft()
+            d.errback(failure)
