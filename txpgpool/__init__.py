@@ -8,17 +8,51 @@ from psycopg2 import connect as pgConnect
 from psycopg2.extras import DictConnection
 from txpostgres.txpostgres import Connection
 
+
 class TxDictConnection(Connection):
+
     @staticmethod
     def connectionFactory(*args, **kwargs):
         kwargs['connection_factory'] = DictConnection
         return pgConnect(*args, **kwargs)
+
 
 def connect(**params):
     return TxDictConnection().connect(**params)
 
 def echo(failure):
     log.err(failure.getErrorMessage())
+
+
+def _connRunQuery(conn, pool, *args, **kwargs):
+    """Called when a connection is acquired for the deferred from`runQuery`.
+    The result will proceed to the callback, and the connection will be
+    returned to the pool"""
+
+    d = Deferred()
+    internal = conn.runQuery(*args, **kwargs)
+
+    @internal.addCallback
+    def onQueryResult(result):
+        pool.putback(conn)
+        d.callback(result)
+
+    @internal.addErrback
+    def onQueryFailure(failure):
+        pool.putback(conn)
+        d.errback(failure)
+
+    return d
+
+def _connAddObserver(self, conn, observerCallback, channels):
+    conn.addNotifyObserver(observerCallback)
+
+    for channel in channels:
+        log.msg('Listening on channel: ' + channel)
+
+        conn.runOperation('LISTEN ' + channel)\
+            .addErrback(self._notifyError)
+
 
 class BasePgPool(object):
 
@@ -28,48 +62,16 @@ class BasePgPool(object):
         """Returns a defered that will fire the callback with the query result when
         the latter is available. Internally it uses the `_connRunQuery` as an
         intermediate callback."""
-        d = Deferred()
-
-        internal = self.fetch()
-        internal.addCallback(self._connRunQuery, d, *args, **kwargs)
-        internal.addErrback(d.errback)
-
+        d = self.fetch()
+        d.addCallback(_connRunQuery, self, *args, **kwargs)
         return d
-
-    def _connRunQuery(self, conn, final, *args, **kwargs):
-        """Called when a connection is acquired for the deferred from`runQuery`.
-        The result will proceed to the callback, and the connection will be
-        returned to the pool"""
-
-        internal = conn.runQuery(*args, **kwargs)
-
-        @internal.addCallback
-        def onQueryResult(result):
-            self.putback(conn)
-            final.callback(result)
-
-        @internal.addErrback
-        def onQueryFailure(failure):
-            self.putback(conn)
-            final.errback(failure)
-
-        return final
 
     def addNotifyObserver(self, observerCallback, channels):
         """Sets async listening on `channels`. The payloads from all of them
         will be passed to `observerCallback`.
         Will hold one connection indefinetely"""
         d = self.fetch()
-        d.addCallback(self._addConnObserver, observerCallback, channels)
-
-    def _addConnObserver(self, conn, observerCallback, channels):
-        conn.addNotifyObserver(observerCallback)
-
-        for channel in channels:
-            log.msg('Listening on channel: ' + channel)
-
-            conn.runOperation('LISTEN ' + channel)\
-                .addErrback(self._notifyError)
+        d.addCallback(_connAddObserver, observerCallback, channels)
 
     def fetch(self):
         """Returns a deferred that will fire its callback with a connection when
@@ -151,32 +153,29 @@ class StaticPgPool(BasePgPool):
 
     def fetch(self):
         if self.conn is not None:
-            if self.ready:
+            if self.ready and self.conn is not False:
                 # connected and available
                 self.ready = False
                 return succeed(self.conn)
 
-            # connected but busy
-            d = Deferred()
-            self._waitingForConn.append(d)
-            return d
-
-        # conn is None: first time connecting
-        if not self.ready:
-            raise ValueError, 'Programing error: first time connecting on busy conn.'
-
+        # either connected or connecting
         d = Deferred()
+        self._waitingForConn.append(d)
 
-        internal = connect(**self._params)
-        internal.addErrback(d.errback)
-
-        @internal.addCallback
-        def onConnReady(conn):
-            self.ready = False
-            self.conn = conn
-            d.callback(conn)
+        if self.conn is None:
+            # set as connecting
+            self.conn = False
+            internal = connect(**self._params)
+            internal.addCallback(self.onConnReady)
+            internal.addErrback(d.errback)
 
         return d
+
+    def onConnReady(self, conn):
+        self.conn = conn
+        self.ready = False
+        d = self._waitingForConn.popleft()
+        d.callback(conn)
 
     def putback(self, conn):
         if self._waitingForConn:
@@ -213,13 +212,13 @@ class QueuePgPool(BasePgPool):
         if len(self._available) > 0:
             conn = self._available.pop()
             self._numBusy = self._numBusy + 1
-            return defer.succeed(conn)
+            return succeed(conn)
 
         # no available connections
-        d = Deferred()
 
         if self._numBusy == self._max:
             # overloaded
+            d = Deferred()
             self._waitingForConn.append(d)
             return d
 
@@ -227,14 +226,13 @@ class QueuePgPool(BasePgPool):
         self._numBusy = self._numBusy + 1
 
         internal = connect(**self._params)
-        internal.addCallback(d.callback)
 
         @internal.addErrback
         def onConnError(failure):
             self._numBusy = self._numBusy - 1
-            d.errback(failure)
+            internal.errback()
 
-        return d
+        return internal
 
     def putback(self, conn):
         if self._waitingForConn:
